@@ -7,6 +7,9 @@
 #define SHIELD_TK1_VID 0x0955
 #define SHIELD_TK1_PID 0x7f40
 
+#define JIBO_TK1_VID 0x0955
+#define JIBO_TK1_PID 0x7740
+
 #define IROM_BEGIN              0x00100000
 #define IROM_END                0x0010FFFF
 #define IROM_LEN                0x00010000
