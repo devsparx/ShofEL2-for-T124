@@ -92,6 +92,7 @@ static void write_timeout(u8 val) {
 }
 
 static u32 last_cmd_int_status = 0;  /* INT_STATUS captured on last cmd error */
+static u32 last_read_int_status = 0; /* INT_STATUS captured on last read error */
 
 /*
  * Send a command to the eMMC card via SDHCI.
@@ -174,7 +175,7 @@ static u32 sdmmc4_initialized = 0;
 static u32 init_error = 0;
 
 /* Diagnostic trace: stores CAR/SDHCI state at key init steps */
-static u32 diag[28];
+static u32 diag[40];
 
 /*
  * Perform pad auto-calibration (from IROM reverse engineering at 0x10a788).
@@ -212,8 +213,40 @@ static void sdmmc4_auto_cal(void) {
 
 /*
  * Initialize SDMMC4 controller and eMMC card.
- * Sequence follows Linux kernel sdhci-tegra.c patterns with additions
- * from IROM reverse engineering. All register access is 32-bit only.
+ *
+ * ATTEMPT 29: Call the IROM's device_init_generic() function directly
+ * to perform the pad/pinmux/drive configuration from the IROM's internal
+ * tables. This is the one step we've never done — the IROM calls it
+ * BEFORE the CAR reset cycle, and it configures pad drive strength,
+ * voltage, and pinmux from data-driven tables in the ROM.
+ *
+ * The IROM's device_init_generic is at 0x101EA8 (Thumb).
+ * It reads a table pointer from IRAM at 0x400022FC.
+ * Calling convention: r0 = device_index (0), r1 = voltage_mode (2 or 3).
+ *
+ * Diagnostic layout (diag[0..39] → regs[16..55]):
+ *   [0]  CLK_OUT_ENB_L (residual)
+ *   [1]  RST_DEVICES_L (residual)
+ *   [2]  CLK_SOURCE_SDMMC4 (residual)
+ *   [3]  IO_DPD2_STATUS (residual)
+ *   [4]  IRAM[0x400022FC] (table pointer)
+ *   [5]  table[0] (first word of table data)
+ *   [6]  table[1] (second word)
+ *   [7]  CAPABILITIES
+ *   [8]  device_init_generic return value
+ *   [9]  0x2C after stable poll
+ *   [10] stable flag (0 or 1)
+ *   [11] 0x2C final
+ *   [12] 0x28 final (host+power)
+ *   [13] PRESENT_STATE (before CMD0)
+ *   [14] VENDOR_CLK_CTRL (after init)
+ *   [15] VENDOR_MISC_CTRL (after init)
+ *   [19] PLLP_BASE
+ *   [20] PMC+0xE8 (before)
+ *   [30] result: 0=fail, 1=stable, 2=CMD0 OK
+ *   [33] CMD error code
+ *   [34] CMD INT_STATUS
+ *   [35] CMD PRESENT_STATE
  */
 static void init_sdmmc4(void) {
     u32 timeout;
@@ -223,223 +256,208 @@ static void init_sdmmc4(void) {
 
     init_error = 0;
 
-    /* Diagnostic: state BEFORE our init */
-    diag[0] = read32(CAR_BASE + 0x10);    /* CLK_OUT_ENB_L (bit15=SDMMC4 clk gate) */
-    diag[1] = read32(CAR_BASE + 0x04);    /* RST_DEVICES_L (bit15=SDMMC4 reset) */
+    /* ============================================================
+     * PHASE 0: RESIDUAL STATE + IRAM TABLE CHECK
+     * ============================================================ */
+
+    /* CAR state */
+    diag[0] = read32(CAR_BASE + 0x10);    /* CLK_OUT_ENB_L */
+    diag[1] = read32(CAR_BASE + 0x04);    /* RST_DEVICES_L */
     diag[2] = read32(CAR_BASE + 0x164);   /* CLK_SOURCE_SDMMC4 */
-    diag[3] = read32(PMC_BASE + 0x1C4);   /* IO_DPD2_STATUS before */
+    diag[19] = read32(CAR_BASE + 0xA0);   /* PLLP_BASE */
 
-    /* === Step 1: Release I/O pads from Deep Power Down === */
-    write32(PMC_BASE + 0x1B8, 0x7FFFFFFF);  /* DPD_OFF all DPD1 signals */
-    delay(2000);
-    write32(PMC_BASE + 0x1C0, 0x7FFFFFFF);  /* DPD_OFF all DPD2 signals */
-    delay(5000);
-    diag[4] = read32(PMC_BASE + 0x1C4);   /* IO_DPD2_STATUS after release */
+    /* PMC state */
+    diag[3] = read32(PMC_BASE + 0x1C4);   /* IO_DPD2_STATUS */
+    diag[20] = read32(PMC_BASE + 0xE8);   /* PMC+0xE8 */
 
-    /* === Step 2: Configure SDMMC4 pinmux === */
-    /* SDMMC4 pins on T124 at APB_MISC pinmux registers.
-     * IROM left these as func=2(RSVD2), tristate=1. Must reconfigure.
-     * Pinmux bits: [1:0]=FUNC, [3:2]=PUPD, [4]=TRISTATE, [5]=E_INPUT, [8]=IO_HV
-     * CLK: func=0(SDMMC4), pupd=00(none), tri=0, e_input=1, IO_HV=1 → 0x120
-     * CMD/DAT: func=0(SDMMC4), pupd=10(pull-up), tri=0, e_input=1, IO_HV=1 → 0x128
-     */
-    diag[20] = read32(0x70003260);  /* SDMMC4_CLK pinmux BEFORE */
-    diag[21] = read32(0x70003270);  /* SDMMC4_DAT2 pinmux BEFORE */
-
-    write32(0x70003260, 0x00000120);  /* SDMMC4_CLK: SDMMC4 func, no pull, e_in, IO_HV */
-    write32(0x70003264, 0x00000128);  /* SDMMC4_CMD: SDMMC4 func, pull-up, e_in, IO_HV */
-    write32(0x70003268, 0x00000128);  /* SDMMC4_DAT0 */
-    write32(0x7000326C, 0x00000128);  /* SDMMC4_DAT1 */
-    write32(0x70003270, 0x00000128);  /* SDMMC4_DAT2 */
-    write32(0x70003274, 0x00000128);  /* SDMMC4_DAT3 */
-    write32(0x70003278, 0x00000128);  /* SDMMC4_DAT4 */
-    write32(0x7000327C, 0x00000128);  /* SDMMC4_DAT5 */
-    write32(0x70003280, 0x00000128);  /* SDMMC4_DAT6 */
-    write32(0x70003284, 0x00000128);  /* SDMMC4_DAT7 */
-    (void)read32(0x70003284);         /* readback commit */
-    delay(2000);
-
-    diag[22] = read32(0x70003260);  /* SDMMC4_CLK pinmux AFTER */
-    diag[23] = read32(0x70003270);  /* SDMMC4_DAT2 pinmux AFTER */
-
-    /* === Step 3: CAR Clock and Reset === */
-    write32(CAR_BASE + 0x324, CAR_SDMMC4_BIT);   /* CLK_OUT_ENB_L_CLR */
-    (void)read32(CAR_BASE + 0x10);
-    write32(CAR_BASE + CAR_RST_DEV_L_SET, CAR_SDMMC4_BIT);
-    (void)read32(CAR_BASE + 0x04);
-
-    /* CLK_SOURCE_SDMMC4: Use PLLP_OUT0 (mux index 0, confirmed locked).
-     * Previous tests with CLK_M (mux 6) failed. Now pinmux is fixed, retry PLLP.
-     * PLLP=408MHz, CAR div N=30 → rate = 408*2/(30+2) = 25.5 MHz module clock.
-     * SDHCI div=0x20(32) → card_clk = 25.5/64 = 398 KHz ✓ */
-    write32(CAR_BASE + 0x164, 0x0000001E);  /* PLLP, N=30 (25.5 MHz) */
-    (void)read32(CAR_BASE + 0x164);          /* readback commit */
-    delay(2000);
-
-    write32(CAR_BASE + CAR_CLK_ENB_L_SET, CAR_SDMMC4_BIT);
-    (void)read32(CAR_BASE + 0x10);
-    delay(10000);
-    write32(CAR_BASE + CAR_RST_DEV_L_CLR, CAR_SDMMC4_BIT);
-    (void)read32(CAR_BASE + 0x04);
-    delay(10000);
-    diag[5] = read32(CAR_BASE + 0x10);    /* CLK_OUT_ENB_L after */
-
-    /* === Step 3: SDHCI Full Reset (Linux: sdhci_reset + tegra_sdhci_reset) === */
-    write_swrst(SDHCI_RESET_ALL);
-    timeout = 100000;
-    while ((read_swrst() & SDHCI_RESET_ALL) && --timeout) {
-        delay(1);
-    }
-    diag[6] = read32(SDMMC4_BASE + 0x2C);  /* 0x2C after reset (should be 0) */
-    diag[7] = timeout;  /* >0 = reset completed, 0 = timed out */
-
-    /* === Step 4: Configure Vendor Registers (from Linux sdhci-tegra.c) === */
-    /* VENDOR_MISC_CTRL: Enable SDHCI Spec 3.0 mode (REQUIRED for T124) */
-    or32(SDMMC4_BASE + SDMMC_VENDOR_MISC_CTRL, SDMMC_MISC_CTRL_SPEC_300);
-    (void)read32(SDMMC4_BASE + SDMMC_VENDOR_MISC_CTRL);
-
-    /* VENDOR_CLK_CTRL: Set PADPIPE_CLKEN_OVERRIDE, clear SPI_MODE_CLKEN_OVERRIDE */
+    /* Read IROM's IRAM table pointer for device_init_generic */
+    diag[4] = read32(0x400022FC);  /* table pointer array base */
     {
-        u32 clk_ctrl = read32(SDMMC4_BASE + SDMMC_VENDOR_CLK_CTRL);
-        clk_ctrl |= SDMMC_CLK_CTRL_PADPIPE;
-        clk_ctrl &= ~SDMMC_CLK_CTRL_SPI_MODE;
-        write32(SDMMC4_BASE + SDMMC_VENDOR_CLK_CTRL, clk_ctrl);
-        (void)read32(SDMMC4_BASE + SDMMC_VENDOR_CLK_CTRL);
+        u32 tbl = diag[4];
+        if ((tbl >= 0x100000 && tbl < 0x110000) ||
+            (tbl >= 0x40000000 && tbl < 0x40040000)) {
+            diag[5] = read32(tbl);      /* table[0] */
+            diag[6] = read32(tbl + 4);  /* table[1] */
+        } else {
+            diag[5] = 0xBAD00BAD;
+            diag[6] = 0xBAD00BAD;
+        }
     }
 
-    diag[8] = read32(SDMMC4_BASE + SDMMC_VENDOR_MISC_CTRL);
-    diag[9] = read32(SDMMC4_BASE + SDMMC_VENDOR_CLK_CTRL);
-
-    /* === Step 4b: Additional vendor config (from Hekate research) === */
-
-    /* iospare: Set bit 19 ("1 cycle delayed cmd_oen") */
-    or32(SDMMC4_BASE + 0x1F0, (1u << 19));
-    (void)read32(SDMMC4_BASE + 0x1F0);
-
-    /* veniotrimctl: Clear bit 2 ("Band Gap VREG to supply DLL") */
-    and32(SDMMC4_BASE + 0x1AC, ~(1u << 2));
-    (void)read32(SDMMC4_BASE + 0x1AC);
-
-    /* venclkgatehystcnt: Set max hysteresis to prevent auto clock gating */
-    write32(SDMMC4_BASE + 0x1D0, 0x0000FFFF);
-    (void)read32(SDMMC4_BASE + 0x1D0);
-
-    /* vendor_sys_sw_ctrl: Try clock gate override bits (speculative, T210-style) */
-    or32(SDMMC4_BASE + 0x104, 0x03);
-    (void)read32(SDMMC4_BASE + 0x104);
-
-    diag[24] = read32(SDMMC4_BASE + 0x1AC);  /* veniotrimctl after */
-    diag[25] = read32(SDMMC4_BASE + 0x1F0);  /* iospare after */
-    diag[26] = read32(SDMMC4_BASE + 0x1D0);  /* venclkgatehystcnt after */
-    diag[27] = read32(SDMMC4_BASE + 0x104);  /* vendor_sys_sw_ctrl after */
-
-    /* === Step 5: Pad auto-calibration === */
-    sdmmc4_auto_cal();
-    diag[10] = read32(SDMMC4_BASE + SDMMC_AUTO_CAL_STATUS);
-
-    /* === Step 6: Bus Power FIRST (SDHCI spec 3.2.1: power before clock) === */
-    /* T124 quirk: SINGLE_POWER_WRITE - set voltage + enable in one write */
-    write_pwrctl(0x0D);  /* SD Bus Voltage: 3.0V (bits[3:1]=110) + Bus Power ON (bit 0) */
-    (void)read8(SDMMC4_BASE + 0x29);  /* readback commit */
+    /* Ensure SDMMC4 clock on for register reads */
+    if (!(diag[0] & CAR_SDMMC4_BIT))
+        write32(CAR_BASE + CAR_CLK_ENB_L_SET, CAR_SDMMC4_BIT);
+    if (diag[1] & CAR_SDMMC4_BIT)
+        write32(CAR_BASE + CAR_RST_DEV_L_CLR, CAR_SDMMC4_BIT);
+    (void)read32(CAR_BASE + 0x04);
     delay(5000);
 
-    /* === Step 7: Host Control (1-bit bus width for init) === */
-    write_hostctl(0x00);
-    (void)read8(SDMMC4_BASE + 0x28);
+    diag[7] = read32(SDMMC4_BASE + 0x40);  /* CAPABILITIES */
 
-    /* Timeout control */
-    write_timeout(0x0E);
-    (void)read8(SDMMC4_BASE + 0x2E);
+    /* ============================================================
+     * PHASE 1: CALL IROM's device_init_generic
+     * ============================================================
+     * This is the missing step! The IROM calls this function at
+     * 0x101EA8 BEFORE the CAR reset cycle. It configures:
+     *   - Pinmux (with tristate sequencing)
+     *   - Pad drive strength / voltage mode
+     *   - Possibly pad group registers
+     *
+     * The function reads its table from IRAM at 0x400022FC.
+     * This IRAM area (offset 0x22FC) is below the stack area
+     * and should survive our exploit.
+     */
 
-    /* === Step 8: Clock Setup (using 16-bit writes like Linux kernel) === */
-    /* First disable all clocks (clean state) */
-    write_clkctl(0x0000);
-    (void)read16(SDMMC4_BASE + 0x2C);  /* readback commit */
+    /* Release DPD first (IROM does this earlier in boot) */
+    write32(PMC_BASE + 0x1B8, 0x7FFFFFFF);
+    delay(2000);
+    write32(PMC_BASE + 0x1C0, 0x7FFFFFFF);
+    delay(5000);
+
+    /* Clear PMC+0xE8 bit 1 (IROM does this before device_init_generic) */
+    and32(PMC_BASE + 0xE8, ~0x2u);
     delay(1000);
 
-    /* Set SDHCI divider + Internal Clock Enable (16-bit write) */
-    /* div=0x20 (Spec3.0: base_clk / 64 = ~187 KHz with 12 MHz CLK_M) */
-    write_clkctl(0x2001);
-    (void)read16(SDMMC4_BASE + 0x2C);  /* readback commit */
-
-    /* Poll Internal Clock Stable (bit 1) with 100ms hardware timer timeout */
+    /* Call IROM's device_init_generic(0, 3)
+     * Args: r0=0 (device index for SDMMC4), r1=3 (3.3V voltage mode)
+     * Address 0x101EA8 | 1 = 0x101EA9 for Thumb mode call */
     {
-        u32 start = read32(0x60005010);  /* TIMERUS_CNTR_1US */
-        u32 stable = 0;
-        while ((read32(0x60005010) - start) < 100000) {  /* 100ms */
-            if (read_clkctl() & 0x0002) {
-                stable = 1;
+        typedef int (*dev_init_fn_t)(int device, int voltage);
+        dev_init_fn_t irom_dev_init = (dev_init_fn_t)(0x101EA9);
+        diag[8] = (u32)irom_dev_init(0, 3);
+    }
+
+    /* ============================================================
+     * PHASE 2: CAR RESET + SDHCI INIT (same as IROM does AFTER
+     * device_init_generic)
+     * ============================================================ */
+
+    /* CAR: assert reset */
+    or32(CAR_BASE + 0x04, CAR_SDMMC4_BIT);
+    (void)read32(CAR_BASE + 0x04);
+    delay(2000);
+
+    /* Set clock source: PLLP, N=0x20 → 24 MHz */
+    write32(CAR_BASE + 0x164, 0x00000020);
+    (void)read32(CAR_BASE + 0x164);
+    delay(2000);
+
+    /* Enable SDMMC4 clock */
+    or32(CAR_BASE + 0x10, CAR_SDMMC4_BIT);
+    (void)read32(CAR_BASE + 0x10);
+    delay(2000);
+
+    /* Deassert SDMMC4 reset */
+    and32(CAR_BASE + 0x04, ~CAR_SDMMC4_BIT);
+    (void)read32(CAR_BASE + 0x04);
+    delay(2000);
+
+    /* Auto-calibration */
+    sdmmc4_auto_cal();
+
+    /* Clock Control: IntClkEn + div=0x20, 32-bit write */
+    write32(SDMMC4_BASE + 0x2C, 0x00002001);
+    (void)read32(SDMMC4_BASE + 0x2C);
+
+    /* Poll for stable (100ms) */
+    {
+        u32 start = read32(0x60005010);
+        diag[10] = 0;
+        while ((read32(0x60005010) - start) < 100000) {
+            if (read32(SDMMC4_BASE + 0x2C) & 0x0002) {
+                diag[10] = 1;
                 break;
             }
         }
-        diag[11] = (u32)read_clkctl();     /* Clock Control after poll (16-bit) */
-        diag[12] = stable;                  /* 1=stable achieved, 0=timeout */
+        diag[9] = read32(SDMMC4_BASE + 0x2C);
     }
 
-    /* If stable bit didn't set, continue with extra settling delay */
-    if (!(diag[12])) {
-        u32 start = read32(0x60005010);
-        while ((read32(0x60005010) - start) < 10000) ;  /* extra 10ms */
-    }
-
-    /* === Step 9: Enable SD Clock to card (bit 2, 16-bit write) === */
-    write_clkctl(read_clkctl() | 0x0004);
-    (void)read16(SDMMC4_BASE + 0x2C);  /* readback commit */
+    /* Power ON */
+    write32(SDMMC4_BASE + 0x28, 0x00000D00);
+    (void)read32(SDMMC4_BASE + 0x28);
     delay(5000);
 
-    diag[13] = read32(SDMMC4_BASE + 0x2C);   /* final 0x2C (clk+timeout+reset) */
-    diag[14] = read32(SDMMC4_BASE + 0x28);   /* final host ctrl + power */
-    diag[18] = read32(CAR_BASE + 0xA0);       /* PLLP_BASE (PLL config) */
-    diag[19] = read32(CAR_BASE + 0x164);      /* CLK_SOURCE_SDMMC4 after our write */
+    /* Set data timeout to maximum (TMCLK * 2^27) */
+    write_timeout(0x0E);
 
-    /* Enable interrupt status bits for polling */
-    write32(SDMMC4_BASE + SDHCI_INT_ENABLE, 0x03FF00FF);
+    /* Enable interrupts (0x00FB = IROM's 0x00CB + BUF_WR_READY + BUF_RD_READY for PIO) */
+    write32(SDMMC4_BASE + 0x34, 0x007F00FB);
 
-    /* === eMMC card initialization === */
+    /* Enable SD Clock (only works if stable is set) */
+    {
+        u32 clk = read32(SDMMC4_BASE + 0x2C);
+        clk |= 0x0004;
+        write32(SDMMC4_BASE + 0x2C, clk);
+    }
+    (void)read32(SDMMC4_BASE + 0x2C);
+    delay(5000);
 
-    /* CMD0: GO_IDLE_STATE (now waits for CMD_COMPLETE to verify clock works) */
+    /* Capture final state */
+    diag[11] = read32(SDMMC4_BASE + 0x2C);  /* clock control */
+    diag[12] = read32(SDMMC4_BASE + 0x28);  /* host+power */
+    diag[13] = read32(SDMMC4_BASE + 0x24);  /* PRESENT_STATE */
+    diag[14] = read32(SDMMC4_BASE + 0x100); /* VENDOR_CLK_CTRL */
+    diag[15] = read32(SDMMC4_BASE + 0x120); /* VENDOR_MISC_CTRL */
+
+    diag[30] = diag[10] ? 1 : 0;
+
+    /* === Try CMD0 === */
     cmd_ret = send_cmd(MMC_CMD0, 0);
     if (cmd_ret < 0) {
         init_error = 0xE0000001;
-        diag[15] = (u32)(-cmd_ret);          /* 1=INHIBIT, 2=ERROR, 3=TIMEOUT */
-        diag[16] = last_cmd_int_status;
-        diag[17] = read32(SDMMC4_BASE + SDHCI_PRESENT_STATE);
+        diag[33] = (u32)(-cmd_ret);
+        diag[34] = last_cmd_int_status;
+        diag[35] = read32(SDMMC4_BASE + SDHCI_PRESENT_STATE);
         return;
     }
 
-    /* CMD1: SEND_OP_COND - poll until card ready */
-    timeout = 200;
+    diag[30] = 2;  /* CMD0 succeeded! */
+
+    /* Delay after CMD0 before starting CMD1 */
+    delay(100000);
+
+    /* CMD1: SEND_OP_COND - poll until card ready (bit 31 set)
+     * eMMC spec allows up to 1 second for power-up.
+     * delay(50000) ≈ 12ms on ARM7TDMI @ 12MHz, 2000 retries = ~24 seconds max */
+    diag[16] = 0;  /* first OCR */
+    diag[17] = 0;  /* last OCR */
+    diag[18] = 0;  /* retry count */
+    timeout = 2000;
     while (1) {
         cmd_ret = send_cmd(MMC_CMD1, 0x40FF8080);
         if (cmd_ret < 0) {
             init_error = 0xE0000002;
-            diag[15] = (u32)(-cmd_ret);
-            diag[16] = last_cmd_int_status;
-            diag[17] = read32(SDMMC4_BASE + SDHCI_PRESENT_STATE);
+            diag[33] = (u32)(-cmd_ret);
+            diag[34] = last_cmd_int_status;
+            diag[35] = read32(SDMMC4_BASE + SDHCI_PRESENT_STATE);
             return;
         }
         u32 ocr = read32(SDMMC4_BASE + SDHCI_RESPONSE);
+        diag[18]++;
+        if (diag[16] == 0) diag[16] = ocr;  /* capture first response */
+        diag[17] = ocr;  /* always update last response */
         if (ocr & (1u << 31)) break;
         if (--timeout == 0) { init_error = 0xE0000003; return; }
-        delay(1000);
+        delay(50000);
     }
 
-    /* CMD2: ALL_SEND_CID */
+    diag[30] = 3;  /* CMD1 succeeded! */
+
     cmd_ret = send_cmd(MMC_CMD2, 0);
-    if (cmd_ret < 0) { init_error = 0xE0000004; diag[15] = (u32)(-cmd_ret); diag[16] = last_cmd_int_status; return; }
+    if (cmd_ret < 0) { init_error = 0xE0000004; diag[33] = (u32)(-cmd_ret); diag[34] = last_cmd_int_status; return; }
 
-    /* CMD3: SET_RELATIVE_ADDR (RCA = 1 for eMMC) */
+    diag[30] = 4;  /* CMD2 succeeded! */
+
     cmd_ret = send_cmd(MMC_CMD3, 0x00010000);
-    if (cmd_ret < 0) { init_error = 0xE0000005; diag[15] = (u32)(-cmd_ret); diag[16] = last_cmd_int_status; return; }
+    if (cmd_ret < 0) { init_error = 0xE0000005; diag[33] = (u32)(-cmd_ret); diag[34] = last_cmd_int_status; return; }
 
-    /* CMD7: SELECT_CARD (RCA = 1) */
     cmd_ret = send_cmd(MMC_CMD7, 0x00010000);
-    if (cmd_ret < 0) { init_error = 0xE0000006; diag[15] = (u32)(-cmd_ret); diag[16] = last_cmd_int_status; return; }
+    if (cmd_ret < 0) { init_error = 0xE0000006; diag[33] = (u32)(-cmd_ret); diag[34] = last_cmd_int_status; return; }
 
-    /* CMD16: SET_BLOCKLEN (512 bytes) */
     cmd_ret = send_cmd(MMC_CMD16, 512);
-    if (cmd_ret < 0) { init_error = 0xE0000007; diag[15] = (u32)(-cmd_ret); diag[16] = last_cmd_int_status; return; }
+    if (cmd_ret < 0) { init_error = 0xE0000007; diag[33] = (u32)(-cmd_ret); diag[34] = last_cmd_int_status; return; }
 
+    diag[30] = 5;  /* All CMDs succeeded! */
     sdmmc4_initialized = 1;
 }
 
@@ -474,8 +492,8 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
     timeout = 500000;
     do {
         status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -2; }
-        if (--timeout == 0) return -3;
+        if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -2; }
+        if (--timeout == 0) { last_read_int_status = status; return -3; }
     } while (!(status & SDHCI_INT_CMD_COMPLETE));
 
     write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
@@ -483,8 +501,8 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
     timeout = 500000;
     do {
         status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -4; }
-        if (--timeout == 0) return -5;
+        if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -4; }
+        if (--timeout == 0) { last_read_int_status = status; return -5; }
     } while (!(status & SDHCI_INT_BUF_RD_READY));
 
     for (u32 i = 0; i < 128; i++) {
@@ -494,8 +512,8 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
     timeout = 500000;
     do {
         status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -6; }
-        if (--timeout == 0) return -7;
+        if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -6; }
+        if (--timeout == 0) { last_read_int_status = status; return -7; }
     } while (!(status & SDHCI_INT_XFER_COMPLETE));
 
     write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
@@ -581,14 +599,23 @@ void entry() {
             regs[11] = read32(SDMMC4_BASE + SDHCI_RESPONSE + 8);
             regs[12] = read32(SDMMC4_BASE + SDHCI_RESPONSE + 12);
 
-            /* Init diagnostic trace (diag[0..27]) at regs[16..43] */
-            for (u32 d = 0; d < 28; d++) regs[16 + d] = diag[d];
+            /* Init diagnostic trace (diag[0..39]) at regs[16..55] */
+            for (u32 d = 0; d < 40; d++) regs[16 + d] = diag[d];
 
             /* Try reading sector 0 if init succeeded */
             regs[13] = 0xCAFE0001;
+            regs[14] = 0;  /* read error INT_STATUS (if read fails) */
+            regs[15] = 0;  /* first word of sector 0 (if read succeeds) */
             if (sdmmc4_initialized) {
-                int r = read_emmc_sector(0, &regs[14]);
+                u32 sec_buf[128];
+                last_read_int_status = 0;
+                int r = read_emmc_sector(0, sec_buf);
                 regs[13] = (u32)r;
+                if (r < 0) {
+                    regs[14] = last_read_int_status;
+                } else {
+                    regs[15] = sec_buf[0];  /* first 4 bytes of MBR */
+                }
             }
 
             ep1_in_write_imm(regs, SDMMC4_REG_SIZE, &num_xfer);
