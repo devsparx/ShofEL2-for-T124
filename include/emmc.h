@@ -15,6 +15,7 @@
 #define SDHCI_BUFFER            0x20
 #define SDHCI_PRESENT_STATE     0x24
 #define SDHCI_HOST_CONTROL      0x28
+#define SDHCI_POWER_CONTROL     0x29
 #define SDHCI_CLOCK_CONTROL     0x2C
 #define SDHCI_SOFTWARE_RESET    0x2F
 #define SDHCI_INT_STATUS        0x30
@@ -79,8 +80,16 @@
 #define XFER_MODE_READ      0x0010  /* Data direction = read, single block, PIO */
 #define XFER_MODE_WRITE     0x0000  /* Data direction = write, single block, PIO */
 
+/* Additional transfer mode bits */
+#define XFER_MODE_BLOCK_COUNT_ENABLE 0x0002  /* enable block count register */
+#define XFER_MODE_AUTO_CMD12         0x0004  /* autostop after multiblock transfer */
+#define XFER_MODE_MULTI_BLOCK        0x0020  /* the actuall multiblock transfer */
+
+#define XFER_MODE_READ_MULTI  (XFER_MODE_READ  | XFER_MODE_BLOCK_COUNT_ENABLE | XFER_MODE_AUTO_CMD12 | XFER_MODE_MULTI_BLOCK)
+#define XFER_MODE_WRITE_MULTI (XFER_MODE_WRITE | XFER_MODE_BLOCK_COUNT_ENABLE | XFER_MODE_AUTO_CMD12 | XFER_MODE_MULTI_BLOCK)
+
 /* CAR (Clock and Reset Controller) registers for SDMMC4 */
-#define CAR_BASE            0x60006000
+#define CAR_BASE            0x60006000 
 #define CAR_CLK_ENB_L_SET   0x320
 #define CAR_RST_DEV_L_CLR   0x304
 #define CAR_RST_DEV_L_SET   0x300

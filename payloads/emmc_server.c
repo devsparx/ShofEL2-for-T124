@@ -63,10 +63,6 @@ static u16 read_clkctl(void) {
     return read16(SDMMC4_BASE + 0x2C);
 }
 
-static void write_clkctl(u16 val) {
-    write16(SDMMC4_BASE + 0x2C, val);
-}
-
 /* Software Reset: 8-bit register at offset 0x2F */
 static void write_swrst(u8 bits) {
     write8(SDMMC4_BASE + 0x2F, bits);
@@ -77,13 +73,12 @@ static u8 read_swrst(void) {
 }
 
 /* Host Control: 8-bit at offset 0x28 */
-static void write_hostctl(u8 val) {
-    write8(SDMMC4_BASE + 0x28, val);
+static u8 read_hostctl(void) {
+    return read8(SDMMC4_BASE + SDHCI_HOST_CONTROL);
 }
 
-/* Power Control: 8-bit at offset 0x29 */
-static void write_pwrctl(u8 val) {
-    write8(SDMMC4_BASE + 0x29, val);
+static void write_hostctl(u8 val) {
+    write8(SDMMC4_BASE + SDHCI_HOST_CONTROL, val);
 }
 
 /* Timeout Control: 8-bit at offset 0x2E */
@@ -170,6 +165,8 @@ static int send_cmd(u32 cmd_val, u32 argument) {
 #define MMC_CMD3    0x031A  /* SET_RELATIVE_ADDR: R1, CRC+index check */
 #define MMC_CMD7    0x071B  /* SELECT_CARD: R1b, CRC+index check */
 #define MMC_CMD16   0x101A  /* SET_BLOCKLEN: R1, CRC+index check */
+#define MMC_CMD18   0x123A  /* READ_MULTIPLE_BLOCK: R1, data, CRC+index check */
+#define MMC_CMD12   0x0C1B  /* STOP_TRANSMISSION: R1b, no data, CRC+index check */
 
 static u32 sdmmc4_initialized = 0;
 static u32 init_error = 0;
@@ -355,15 +352,15 @@ static void init_sdmmc4(void) {
     /* Auto-calibration */
     sdmmc4_auto_cal();
 
-    /* Clock Control: IntClkEn + div=0x20, 32-bit write */
-    write32(SDMMC4_BASE + 0x2C, 0x00002001);
-    (void)read32(SDMMC4_BASE + 0x2C);
+    /* Clock Control: IntClkEn + div=0x01 (proven 160KB/s speed) */
+    write32(SDMMC4_BASE + SDHCI_CLOCK_CONTROL, 0x00000101);
+    (void)read32(SDMMC4_BASE + SDHCI_CLOCK_CONTROL);
 
-    /* Poll for stable (100ms) */
+    /* Poll stable with shorter timeout, accept if not stable */
     {
         u32 start = read32(0x60005010);
         diag[10] = 0;
-        while ((read32(0x60005010) - start) < 100000) {
+        while ((read32(0x60005010) - start) < 50000) {  /* reduced from 100ms to 50ms */
             if (read32(SDMMC4_BASE + 0x2C) & 0x0002) {
                 diag[10] = 1;
                 break;
@@ -372,10 +369,13 @@ static void init_sdmmc4(void) {
         diag[9] = read32(SDMMC4_BASE + 0x2C);
     }
 
-    /* Power ON */
+    /*power ON (host control + power) */
     write32(SDMMC4_BASE + 0x28, 0x00000D00);
     (void)read32(SDMMC4_BASE + 0x28);
     delay(5000);
+
+    /* turn on SDHCI 3.0 mode*/
+    write32(SDMMC4_BASE + SDMMC_VENDOR_MISC_CTRL, SDMMC_MISC_CTRL_SPEC_300);
 
     /* Set data timeout to maximum (TMCLK * 2^27) */
     write_timeout(0x0E);
@@ -477,19 +477,24 @@ static void reset_cmd_dat(void) {
     while ((read_swrst() & (SDHCI_RESET_CMD | SDHCI_RESET_DAT)) && --timeout) ;
 }
 
-/* Read a single 512-byte sector from eMMC */
-static int read_emmc_sector(u32 sector, u32 *buffer) {
+/* Read N sectors directly into a target address (for DMA) */
+static int read_emmc_sectors_addr(u32 sector, u32 count, u32 addr) {
     u32 status;
     u32 timeout;
 
+    if (count == 0) return 0;
     if (wait_ready() < 0) return -1;
 
-    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
-    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (1 << 16) | 0x200);
-    write32(SDMMC4_BASE + SDHCI_ARGUMENT, sector);
-    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE, ((u32)MMC_CMD17_READ << 16) | XFER_MODE_READ);
+    /* Set SDMA address register to target address */
+    write32(SDMMC4_BASE + 0x00, addr);  /* SDMA System Address */
 
-    timeout = 500000;
+    /* Block count is written in the upper half of BLOCK_SIZE register */
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (count << 16) | 0x200);
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, sector);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE,
+                    ((u32)MMC_CMD18 << 16) | XFER_MODE_READ_MULTI);
+    timeout = 1000000;  /* increased timeout */
     do {
         status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
         if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -2; }
@@ -498,18 +503,7 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
 
     write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
 
-    timeout = 500000;
-    do {
-        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -4; }
-        if (--timeout == 0) { last_read_int_status = status; return -5; }
-    } while (!(status & SDHCI_INT_BUF_RD_READY));
-
-    for (u32 i = 0; i < 128; i++) {
-        buffer[i] = read32(SDMMC4_BASE + SDHCI_BUFFER);
-    }
-
-    timeout = 500000;
+    timeout = 2000000;
     do {
         status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
         if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -6; }
@@ -518,6 +512,60 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
 
     write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
     return 0;
+}
+
+static int read_emmc_sectors(u32 sector, u32 count, u32 *buffer) {
+    u32 status;
+    u32 timeout;
+
+    if (count == 0) return 0;
+    if (wait_ready() < 0) return -1;
+
+    /* note AGAIN > Block count is written in the upper half of BLOCK_SIZE register */
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (count << 16) | 0x200);  /* back to 512B */
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, sector);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE,
+                    ((u32)MMC_CMD18 << 16) | XFER_MODE_READ_MULTI);
+    timeout = 1000000;  /* increased timeout for multi-block */
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -2; }
+        if (--timeout == 0) { last_read_int_status = status; return -3; }
+    } while (!(status & SDHCI_INT_CMD_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+
+    for (u32 blk = 0; blk < count; blk++) {
+        timeout = 2000000;  /* timeout */
+        do {
+            status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+            if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -4; }
+            if (--timeout == 0) { last_read_int_status = status; return -5; }
+        } while (!(status & SDHCI_INT_BUF_RD_READY));
+
+        for (u32 i = 0; i < 128; i++) {
+            buffer[blk * 128 + i] = read32(SDMMC4_BASE + SDHCI_BUFFER);
+        }
+
+        /* Clear buffer ready so we can wait for the next block */
+        write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_BUF_RD_READY);
+    }
+
+    timeout = 2000000;  /* timeout for transfer complete */
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { last_read_int_status = status; reset_cmd_dat(); return -6; }
+        if (--timeout == 0) { last_read_int_status = status; return -7; }
+    } while (!(status & SDHCI_INT_XFER_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    return 0;
+}
+
+/* Read a single 512-byte sector from eMMC */
+static int read_emmc_sector(u32 sector, u32 *buffer) {
+    return read_emmc_sectors(sector, 1, buffer);
 }
 
 /* Write a single 512-byte sector to eMMC */
@@ -631,13 +679,11 @@ void entry() {
                 u32 batch = remaining > EMMC_CHUNK_SECTORS ? EMMC_CHUNK_SECTORS : remaining;
                 u32 batch_bytes = batch * EMMC_SECTOR_SIZE;
 
-                for (u32 i = 0; i < batch; i++) {
-                    int result = read_emmc_sector(sector + i, (u32*)(buffer + i * EMMC_SECTOR_SIZE));
-                    if (result < 0) {
-                        u32 *err = (u32*)(buffer + i * EMMC_SECTOR_SIZE);
-                        err[0] = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
-                        for (u32 j = 1; j < 128; j++) err[j] = 0xDEADDEAD;
-                    }
+                int result = read_emmc_sectors(sector, batch, (u32*)buffer);
+                if (result < 0) {
+                    u32 *err = (u32*)buffer;
+                    err[0] = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
+                    for (u32 j = 1; j < batch * 128; j++) err[j] = 0xDEADDEAD;
                 }
 
                 ep1_in_write_imm(buffer, batch_bytes, &num_xfer);

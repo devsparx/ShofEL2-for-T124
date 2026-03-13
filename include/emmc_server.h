@@ -13,8 +13,11 @@
 #define EMMC_CMD_STATUS     0x03
 #define EMMC_CMD_EXIT       0xFF
 
-/* Transfer chunk sizes */
-#define EMMC_CHUNK_SECTORS  8
+/* Transfer chunk sizes basically the amount much data is sent/received per USB transfer was not multiple of 0x1000
+ *
+ * 6 sectors = 3KB per batch. Finding the exact sweet spot.
+ */
+#define EMMC_CHUNK_SECTORS  6
 #define EMMC_SECTOR_SIZE    512
 #define EMMC_CHUNK_BYTES    (EMMC_CHUNK_SECTORS * EMMC_SECTOR_SIZE)
 
