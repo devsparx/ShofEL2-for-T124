@@ -166,6 +166,8 @@ static int send_cmd(u32 cmd_val, u32 argument) {
 #define MMC_CMD7    0x071B  /* SELECT_CARD: R1b, CRC+index check */
 #define MMC_CMD16   0x101A  /* SET_BLOCKLEN: R1, CRC+index check */
 #define MMC_CMD18   0x123A  /* READ_MULTIPLE_BLOCK: R1, data, CRC+index check */
+#define MMC_CMD24   0x183A  /* WRITE_BLOCK: R1, data, CRC+index check */
+#define MMC_CMD25   0x193A  /* WRITE_MULTIPLE_BLOCK: R1, data, CRC+index check */
 #define MMC_CMD12   0x0C1B  /* STOP_TRANSMISSION: R1b, no data, CRC+index check */
 
 static u32 sdmmc4_initialized = 0;
@@ -568,6 +570,56 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
     return read_emmc_sectors(sector, 1, buffer);
 }
 
+/* Write N sectors to eMMC using multi-block CMD25 */
+static int write_emmc_sectors(u32 sector, u32 count, u32 *buffer) {
+    u32 status;
+    u32 timeout;
+
+    if (count == 0) return 0;
+    if (wait_ready() < 0) return -1;
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (count << 16) | 0x200);
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, sector);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE,
+                    ((u32)MMC_CMD25 << 16) | XFER_MODE_WRITE_MULTI);
+
+    timeout = 1000000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -2; }
+        if (--timeout == 0) { return -3; }
+    } while (!(status & SDHCI_INT_CMD_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+
+    /* Write all data */
+    for (u32 blk = 0; blk < count; blk++) {
+        timeout = 2000000;
+        do {
+            status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+            if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -4; }
+            if (--timeout == 0) { return -5; }
+        } while (!(status & SDHCI_INT_BUF_WR_READY));
+
+        for (u32 i = 0; i < 128; i++) {
+            write32(SDMMC4_BASE + SDHCI_BUFFER, buffer[blk * 128 + i]);
+        }
+
+        write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_BUF_WR_READY);
+    }
+
+    timeout = 2000000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -6; }
+        if (--timeout == 0) { return -7; }
+    } while (!(status & SDHCI_INT_XFER_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    return 0;
+}
+
 /* Write a single 512-byte sector to eMMC */
 static int write_emmc_sector(u32 sector, u32 *buffer) {
     u32 status;
@@ -578,7 +630,7 @@ static int write_emmc_sector(u32 sector, u32 *buffer) {
     write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
     write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (1 << 16) | 0x200);
     write32(SDMMC4_BASE + SDHCI_ARGUMENT, sector);
-    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE, ((u32)MMC_CMD24_WRITE << 16) | XFER_MODE_WRITE);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE, ((u32)MMC_CMD24 << 16) | XFER_MODE_WRITE);
 
     timeout = 500000;
     do {
@@ -707,12 +759,10 @@ void entry() {
                 ep1_out_read_imm(buffer, batch_bytes, &num_xfer);
 
                 if (write_result == 0) {
-                    for (u32 i = 0; i < batch; i++) {
-                        int result = write_emmc_sector(sector + i, (u32*)(buffer + i * EMMC_SECTOR_SIZE));
-                        if (result < 0) {
-                            write_result = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
-                            break;
-                        }
+                    /* Use multi-block write for speed (same optimization as reads) */
+                    int result = write_emmc_sectors(sector, batch, (u32*)buffer);
+                    if (result < 0) {
+                        write_result = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
                     }
                 }
 
