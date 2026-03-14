@@ -44,22 +44,22 @@ build/obj_arm/%.o: payloads/%.c
 	$(CC_ARM) $(CFLAGS_ARM) -c -o $@ $<
 
 build/reset_example.elf: build/obj_arm/reset_example.o
-	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^
+	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^ -lgcc
 
 build/jtag_example.elf: build/obj_arm/jtag_example.o
-	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^
+	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^ -lgcc
 
 build/boot_bct.elf: build/obj_arm/boot_bct.o
-	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^
+	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^ -lgcc
 
 build/mem_dumper_usb_server.elf: build/obj_arm/mem_dumper_usb_server.o
-	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^
+	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^ -lgcc
 
 build/emmc_server.elf: build/obj_arm/emmc_server.o
-	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^
+	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^ -lgcc
 
 build/intermezzo.elf: build/obj_arm/intermezzo.o
-	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^
+	$(CC_ARM) $(CFLAGS_ARM) -o $@ $^ -lgcc
 
 %.bin: build/%.elf
 	$(OBJCOPY_ARM) -O binary $< $@

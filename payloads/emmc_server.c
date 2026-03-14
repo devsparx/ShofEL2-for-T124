@@ -164,11 +164,15 @@ static int send_cmd(u32 cmd_val, u32 argument) {
 #define MMC_CMD2    0x0209  /* ALL_SEND_CID: R2 (136-bit), CRC check */
 #define MMC_CMD3    0x031A  /* SET_RELATIVE_ADDR: R1, CRC+index check */
 #define MMC_CMD7    0x071B  /* SELECT_CARD: R1b, CRC+index check */
+#define MMC_CMD8    0x083A  /* SEND_EXT_CSD: R1, 512-byte data, CRC+index check */
+#define MMC_CMD12   0x0C1B  /* STOP_TRANSMISSION: R1b, no data, CRC+index check */
 #define MMC_CMD16   0x101A  /* SET_BLOCKLEN: R1, CRC+index check */
 #define MMC_CMD18   0x123A  /* READ_MULTIPLE_BLOCK: R1, data, CRC+index check */
 #define MMC_CMD24   0x183A  /* WRITE_BLOCK: R1, data, CRC+index check */
 #define MMC_CMD25   0x193A  /* WRITE_MULTIPLE_BLOCK: R1, data, CRC+index check */
-#define MMC_CMD12   0x0C1B  /* STOP_TRANSMISSION: R1b, no data, CRC+index check */
+#define MMC_CMD35   0x233A  /* ERASE_GROUP_START: R1, CRC+index check */
+#define MMC_CMD36   0x243A  /* ERASE_GROUP_END: R1, CRC+index check */
+#define MMC_CMD38   0x263B  /* ERASE: R1b, CRC+index check */
 
 static u32 sdmmc4_initialized = 0;
 static u32 init_error = 0;
@@ -571,55 +575,6 @@ static int read_emmc_sector(u32 sector, u32 *buffer) {
 }
 
 /* Write N sectors to eMMC using multi-block CMD25 */
-static int write_emmc_sectors(u32 sector, u32 count, u32 *buffer) {
-    u32 status;
-    u32 timeout;
-
-    if (count == 0) return 0;
-    if (wait_ready() < 0) return -1;
-
-    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
-    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (count << 16) | 0x200);
-    write32(SDMMC4_BASE + SDHCI_ARGUMENT, sector);
-    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE,
-                    ((u32)MMC_CMD25 << 16) | XFER_MODE_WRITE_MULTI);
-
-    timeout = 1000000;
-    do {
-        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -2; }
-        if (--timeout == 0) { return -3; }
-    } while (!(status & SDHCI_INT_CMD_COMPLETE));
-
-    write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
-
-    /* Write all data */
-    for (u32 blk = 0; blk < count; blk++) {
-        timeout = 2000000;
-        do {
-            status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-            if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -4; }
-            if (--timeout == 0) { return -5; }
-        } while (!(status & SDHCI_INT_BUF_WR_READY));
-
-        for (u32 i = 0; i < 128; i++) {
-            write32(SDMMC4_BASE + SDHCI_BUFFER, buffer[blk * 128 + i]);
-        }
-
-        write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_BUF_WR_READY);
-    }
-
-    timeout = 2000000;
-    do {
-        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
-        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -6; }
-        if (--timeout == 0) { return -7; }
-    } while (!(status & SDHCI_INT_XFER_COMPLETE));
-
-    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
-    return 0;
-}
-
 /* Write a single 512-byte sector to eMMC */
 static int write_emmc_sector(u32 sector, u32 *buffer) {
     u32 status;
@@ -658,6 +613,103 @@ static int write_emmc_sector(u32 sector, u32 *buffer) {
         if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -6; }
         if (--timeout == 0) return -7;
     } while (!(status & SDHCI_INT_XFER_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    return 0;
+}
+
+/* Read EXT_CSD register (512 bytes of chip health/configuration data) */
+static int read_ext_csd(u32 *buffer) {
+    u32 status;
+    u32 timeout;
+
+    if (wait_ready() < 0) return -1;
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (1 << 16) | 0x200);  /* 1 block, 512 bytes */
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, 0);  /* EXT_CSD addressed by sector 0 */
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE,
+                    ((u32)MMC_CMD8 << 16) | XFER_MODE_READ);
+
+    timeout = 500000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -2; }
+        if (--timeout == 0) return -3;
+    } while (!(status & SDHCI_INT_CMD_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+
+    timeout = 500000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -4; }
+        if (--timeout == 0) return -5;
+    } while (!(status & SDHCI_INT_BUF_RD_READY));
+
+    /* Read 512 bytes (128 words) of EXT_CSD data */
+    for (u32 i = 0; i < 128; i++) {
+        buffer[i] = read32(SDMMC4_BASE + SDHCI_BUFFER);
+    }
+
+    timeout = 500000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -6; }
+        if (--timeout == 0) return -7;
+    } while (!(status & SDHCI_INT_XFER_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    return 0;
+}
+
+/* Erase a range of sectors - tells eMMC controller data can be discarded/reallocated */
+static int erase_emmc_sectors(u32 start_sector, u32 end_sector) {
+    u32 status;
+    u32 timeout;
+
+    if (wait_ready() < 0) return -1;
+
+    /* CMD35: ERASE_GROUP_START - set start address */
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_BLOCK_SIZE, (1 << 16) | 0x200);
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, start_sector);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE, ((u32)MMC_CMD35 << 16) | 0);
+
+    timeout = 500000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -2; }
+        if (--timeout == 0) return -3;
+    } while (!(status & SDHCI_INT_CMD_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+
+    /* CMD36: ERASE_GROUP_END - set end address */
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, end_sector);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE, ((u32)MMC_CMD36 << 16) | 0);
+
+    timeout = 500000;
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -4; }
+        if (--timeout == 0) return -5;
+    } while (!(status & SDHCI_INT_CMD_COMPLETE));
+
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+
+    /* CMD38: ERASE - actually perform the erase operation */
+    write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
+    write32(SDMMC4_BASE + SDHCI_ARGUMENT, 0);
+    write32(SDMMC4_BASE + SDHCI_TRANSFER_MODE, ((u32)MMC_CMD38 << 16) | 0);
+
+    timeout = 5000000;  /* Erase can take longer than reads/writes */
+    do {
+        status = read32(SDMMC4_BASE + SDHCI_INT_STATUS);
+        if (status & SDHCI_INT_ERROR) { reset_cmd_dat(); return -6; }
+        if (--timeout == 0) return -7;
+    } while (!(status & SDHCI_INT_CMD_COMPLETE));
 
     write32(SDMMC4_BASE + SDHCI_INT_STATUS, 0xFFFFFFFF);
     return 0;
@@ -728,7 +780,7 @@ void entry() {
             u32 remaining = cmd.num_sectors;
 
             while (remaining > 0) {
-                u32 batch = remaining > EMMC_CHUNK_SECTORS ? EMMC_CHUNK_SECTORS : remaining;
+                u32 batch = remaining > EMMC_CHUNK_SECTORS_READ ? EMMC_CHUNK_SECTORS_READ : remaining;
                 u32 batch_bytes = batch * EMMC_SECTOR_SIZE;
 
                 int result = read_emmc_sectors(sector, batch, (u32*)buffer);
@@ -753,16 +805,18 @@ void entry() {
             u32 write_result = 0;
 
             while (remaining > 0) {
-                u32 batch = remaining > EMMC_CHUNK_SECTORS ? EMMC_CHUNK_SECTORS : remaining;
+                u32 batch = remaining > EMMC_CHUNK_SECTORS_WRITE ? EMMC_CHUNK_SECTORS_WRITE : remaining;
                 u32 batch_bytes = batch * EMMC_SECTOR_SIZE;
 
                 ep1_out_read_imm(buffer, batch_bytes, &num_xfer);
 
                 if (write_result == 0) {
-                    /* Use multi-block write for speed (same optimization as reads) */
-                    int result = write_emmc_sectors(sector, batch, (u32*)buffer);
-                    if (result < 0) {
-                        write_result = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
+                    for (u32 i = 0; i < batch; i++) {
+                        int result = write_emmc_sector(sector + i, (u32*)(buffer + i * EMMC_SECTOR_SIZE));
+                        if (result < 0) {
+                            write_result = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
+                            break;
+                        }
                     }
                 }
 
@@ -771,6 +825,35 @@ void entry() {
             }
 
             ep1_in_write_imm(&write_result, 4, &num_xfer);
+            continue;
+        }
+
+        if (cmd.op == EMMC_CMD_READ_EXT_CSD) {
+            init_sdmmc4();
+
+            int result = read_ext_csd((u32*)buffer);
+            if (result < 0) {
+                /* On error, clear the buffer and return zeros */
+                for (u32 i = 0; i < 128; i++) {
+                    ((u32*)buffer)[i] = 0;
+                }
+            }
+
+            /* Send the 512-byte EXT_CSD register back to host */
+            ep1_in_write_imm(buffer, 512, &num_xfer);
+            continue;
+        }
+
+        if (cmd.op == EMMC_CMD_ERASE) {
+            init_sdmmc4();
+            u32 erase_result = 0;
+
+            int result = erase_emmc_sectors(cmd.start_sector, cmd.num_sectors);
+            if (result < 0) {
+                erase_result = 0xDEAD0000 | (u32)((-result) & 0xFFFF);
+            }
+
+            ep1_in_write_imm(&erase_result, 4, &num_xfer);
             continue;
         }
     }
