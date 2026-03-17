@@ -1,6 +1,6 @@
 # ShofEL2 for T124
 
-This is a Fusee Gelee / ShofEL2 exploit port for the Nvidia T124 (a.k.a Jetson TK1, Shield K1, etc).
+This is a Fusee Gelee / ShofEL2 exploit port for the Nvidia T124 specifically for the Jibo Social Robot.
 
 Currently this code allows you to download and execute a payload to the T124, dump the fuses and memory and boot bct without apply the locks.
 
