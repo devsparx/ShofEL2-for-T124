@@ -14,7 +14,9 @@
 #include <ctype.h>
 
 #include <sys/ioctl.h>
+#ifdef __linux__
 #include <linux/usbdevice_fs.h>
+#endif
 
 #define USB_CTRL_DEVICE_ENDPOINT_TO_HOST 0x82
 #define USB_CTRL_GET_STATUS 0x00
