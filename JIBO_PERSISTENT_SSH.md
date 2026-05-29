@@ -138,6 +138,12 @@ patched image back:
 ./shofel2_t124 EMMC_WRITE 0x7e9022 /tmp/jibo-var.img
 ```
 
+If `EMMC_WRITE` reaches the exploit and then fails immediately with
+`USB send failed at sector 8294434 (0x7e9022)`, rebuild with a longer
+`USB_BULK_TIMEOUT`. The first data packet can arrive while the payload is still
+initializing SDMMC; `10000` ms worked reliably where the original `500` ms
+timed out.
+
 When the command prints `Write complete.`, power-cycle Jibo normally with no RCM
 button combo.
 

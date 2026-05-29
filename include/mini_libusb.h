@@ -21,7 +21,10 @@
 #define USB_CTRL_DEVICE_ENDPOINT_TO_HOST 0x82
 #define USB_CTRL_GET_STATUS 0x00
 
-#define USB_BULK_TIMEOUT 500
+/* The eMMC payload may spend several seconds initializing SDMMC before
+ * accepting the first WRITE data packet. Keep host bulk transfers patient.
+ */
+#define USB_BULK_TIMEOUT 10000
 
 #if DEBUG
     #define DEBUG_MSG(fmt, ...) do { fprintf( stderr, "%s:%d:%s(): " fmt, \
@@ -36,4 +39,3 @@ int usb_send_bulk_txn( int usb, uint32_t ep, uint32_t len, void *data );
 int usb_send_control_txn( int usb, uint8_t bRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex, uint16_t len, uint8_t *data, int32_t timeout );
 
 #endif
-
